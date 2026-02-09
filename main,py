@@ -1,0 +1,100 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from passlib.context import CryptContext
+from datetime import datetime
+import sqlite3
+import json
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+DB = "chat.db"
+
+def db():
+    return sqlite3.connect(DB, check_same_thread=False)
+
+# --- DB setup ---
+with db() as conn:
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        username TEXT,
+        content TEXT
+    )""")
+    conn.commit()
+
+clients: list[WebSocket] = []
+
+@app.get("/")
+def index():
+    return FileResponse("static/index.html")
+
+@app.websocket("/ws")
+async def ws(ws: WebSocket):
+    await ws.accept()
+
+    # --- auth ---
+    auth = json.loads(await ws.receive_text())
+    username = auth["username"]
+    password = auth["password"]
+
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT password FROM users WHERE username=?", (username,))
+        row = c.fetchone()
+
+        if row:
+            if not pwd.verify(password, row[0]):
+                await ws.send_text("AUTH_FAIL")
+                await ws.close()
+                return
+        else:
+            c.execute(
+                "INSERT INTO users VALUES (?,?)",
+                (username, pwd.hash(password))
+            )
+            conn.commit()
+
+        await ws.send_text("AUTH_OK")
+
+        # send history
+        for ts, u, msg in c.execute(
+            "SELECT timestamp, username, content FROM messages"
+        ):
+            await ws.send_text(f"[{ts}] {u}: {msg}")
+
+    clients.append(ws)
+
+    try:
+        while True:
+            text = await ws.receive_text()
+            ts = datetime.now().strftime("%H:%M")
+            line = f"[{ts}] {username}: {text}"
+
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO messages(timestamp,username,content) VALUES (?,?,?)",
+                    (ts, username, text),
+                )
+                conn.commit()
+
+            dead = []
+            for c in clients:
+                try:
+                    await c.send_text(line)
+                except:
+                    dead.append(c)
+
+            for d in dead:
+                clients.remove(d)
+
+    except WebSocketDisconnect:
+        clients.remove(ws)
